@@ -109,6 +109,158 @@ def read_detections(lines: list):
         (float(bb_height) + float(bb_top)) / h,  float(score), int(float(class_id)), ])
     return detections_dict
 
+def detect_video_from_frames(
+    test_path: str,
+    config_path: str,
+    checkpoint_files: list,
+    batch_size: int,
+) -> list:
+    process_video_results = []
+    configs_weights = [
+        ('co_dino_5scale_swin_large_16e_o365tococo.py', 'epoch_10.pth'),
+        ('640x640co_dino_5scale_swin_large_16e_o365tococo.py', 'epoch_10.pth'),
+        ('1280x1280co_dino_5scale_swin_large_16e_o365tococo.py', 'epoch_10.pth'),
+        ('640x640co_dino_5scale_swin_large_16e_o365tococo.py', 'epoch_15.pth'),
+        ('1280x1280co_dino_5scale_swin_large_16e_o365tococo.py', 'epoch_15.pth'),
+    ]
+    
+    for config_name, checkpoint_file in configs_weights:
+        config_f_name = config_name.split(".")[0]
+        checkpoint_file = os.path.join(checkpoint_files, checkpoint_file)
+
+        lines = []
+        config_file = os.path.join(config_path, config_name)
+        model = init_detector(config_file, checkpoint_file, DatasetEnum.COCO, device='cuda:0')
+
+        for folder_name in tqdm(os.listdir(test_path)):
+            folder_path = os.path.join(test_path, folder_name)
+            if not os.path.isdir(folder_path):
+                continue
+            
+            video_id = folder_name  # Use folder name as video ID
+            frame_id = 0
+            batch = []
+            is_break = False
+            
+            frame_files = sorted(os.listdir(folder_path))  # Ensure frame order is correct
+            
+            for frame_file in frame_files:
+                frame_path = os.path.join(folder_path, frame_file)
+                img = cv2.imread(frame_path)
+                if img is None:
+                    continue
+                
+                batch.append(img)
+                
+                if len(batch) == batch_size:
+                    print(f"[INFO] Processing batch at frame_id: {frame_id}")
+                    results = inference_detector(model, batch)
+                    for idx, result in enumerate(results):
+                        bbox_result, segm_result = result, None
+                        bboxes = np.vstack(bbox_result)
+                        labels = [
+                            np.full(bbox.shape[0], i, dtype=np.int32)
+                            for i, bbox in enumerate(bbox_result)
+                        ]
+                        labels = np.concatenate(labels)
+                        score_thr = 0.01
+                        scores = None
+                        if score_thr > 0:
+                            scores = bboxes[:, -1]
+                            inds = scores > score_thr
+                            scores = scores[inds]
+                            bboxes = bboxes[inds, :]
+                            labels = labels[inds]
+                        width, height = img.shape[1], img.shape[0]
+                        for label, score, bbox in zip(labels, scores, bboxes):
+                            bbox = list(map(int, bbox))
+                            label = int(label) + 1
+                            w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+                            lines.append(
+                                f"{video_id},{frame_id + idx + 1},{bbox[0]},{bbox[1]},{w},{h},{label},{score}\n"
+                            )
+                    frame_id += len(batch)
+                    batch = []
+            
+            # Process remaining frames if the last batch is incomplete
+            if batch:
+                print(f"[INFO] Processing last batch at frame_id: {frame_id}")
+                results = inference_detector(model, batch)
+                for idx, result in enumerate(results):
+                    # (Repeat bounding box processing here)
+                    pass
+                frame_id += len(batch)
+            
+            process_video_results.append(lines)
+        
+    return process_video_results
+
+
+def fuse_frames(
+    process_video_results: list,
+    frame_path: str,
+    iou_thr: float = 0.7,
+    skip_box_thr: float = 0.0001,
+) -> list:
+    """
+    Fuse detection results using frames instead of videos.
+
+    Args:
+        process_video_results (list): List of detection results for multiple configurations.
+        frame_path (str): Path to the root directory containing frame subdirectories.
+                         Each subdirectory corresponds to a video and contains extracted frames.
+        iou_thr (float): IoU threshold for the WBF algorithm.
+        skip_box_thr (float): Minimum score threshold for WBF.
+
+    Returns:
+        list: Fused detection results.
+    """
+    datas = [read_detections(item) for item in process_video_results]
+    results = []
+    w, h = 1920, 1080  # Assuming all frames are of this resolution
+
+    for video_folder in tqdm(os.listdir(frame_path)):
+        video_id = int(video_folder)  # Each folder represents a video ID
+        frame_folder_path = os.path.join(frame_path, video_folder)
+        for frame_name in sorted(os.listdir(frame_folder_path)):  # Ensure frames are processed in order
+            frame_idx = int(frame_name.split(".")[0])  # Frame name as an integer
+            boxes_list = []
+            scores_list = []
+            labels_list = []
+            weights = [1] * len(datas)
+            weights[0] = 3  # Higher weight for the first configuration
+
+            for data in datas:
+                data_box = []
+                score_box = []
+                label_box = []
+                if video_id in data and frame_idx in data[video_id]:
+                    for box in data[video_id][frame_idx]:
+                        data_box.append(box[:4])
+                        score_box.append(box[4])
+                        label_box.append(box[5])
+                boxes_list.append(data_box)
+                scores_list.append(score_box)
+                labels_list.append(label_box)
+
+            # Apply Weighted Boxes Fusion
+            boxes, scores, labels = weighted_boxes_fusion(
+                boxes_list, scores_list, labels_list, weights=weights,
+                iou_thr=iou_thr, skip_box_thr=skip_box_thr
+            )
+
+            # Store results
+            for i in range(len(boxes)):
+                results.append([
+                    video_id, frame_idx,
+                    boxes[i][0] * w, boxes[i][1] * h,
+                    (boxes[i][2] - boxes[i][0]) * w,
+                    (boxes[i][3] - boxes[i][1]) * h,
+                    labels[i], scores[i]
+                ])
+
+    return results
+
 def detect_video(
     test_path: str,
     config_path: str,
@@ -235,10 +387,13 @@ if __name__ == '__main__':
     config_path = args.config_path
     checkpoint_files = args.checkpoint_path
     print("Start inference")
-    process_video_results = detect_video(test_path, config_path, checkpoint_files, batch_size)
+    # process_video_results = detect_video(test_path, config_path, checkpoint_files, batch_size)
+    process_video_results = detect_video_from_frames(test_path, config_path, checkpoint_files, batch_size)
 
     print("Start Fuse")
-    results = fuse(process_video_results, test_path)
+    # results = fuse(process_video_results, test_path)
+    results = fuse_frames(process_video_results, test_path)
+
 
     print("Start Minority")
     minority_score = minority(p, results)
